@@ -1,143 +1,125 @@
 #!/bin/bash
 # Author: https://github.com/jscblack
 # Description: This script records performance data using perf and generates a flamegraph.
-# Usage: ./perf.sh <pid|exec_file_path> [duration]
-# Modified: 2024.06.05
+# Usage: ./perf.sh -P <pid> [-D <duration>] | -E <exec_file_path> [-I]
+# Modified: 2024.12.27
 
-# 定义输出目录
-# 默认就在运行的位置
+# Constants
 OUTPUT_DIR="./perf_log"
 FLAMEGRAPH_DIR="/path/to/FlameGraph"
-CAPTURE_FREQ=200
+CAPTURE_FREQ=499
 
-# 检查输出目录是否存在，如果不存在则创建它
+# Create output directory if it doesn't exist
 if [ ! -d "$OUTPUT_DIR" ]; then
-    mkdir -p "$OUTPUT_DIR"
-    if [ $? -ne 0 ]; then
-        echo "Error: Failed to create output directory $OUTPUT_DIR."
-        exit 1
-    fi
+    mkdir -p "$OUTPUT_DIR" || { echo "[capture.sh] Error: Failed to create output directory $OUTPUT_DIR."; exit 1; }
 fi
 
-# 检查perf命令是否安装
+# Ensure perf is installed
 if ! command -v perf &> /dev/null; then
-    echo "Error: perf is not installed. Please install perf to use this script."
+    echo "[capture.sh] Error: perf is not installed. Please install perf to use this script."
     exit 1
 fi
 
-# 检查FlameGraph工具是否存在
+# Ensure FlameGraph tools are available
 if [ ! -d "$FLAMEGRAPH_DIR" ]; then
-    echo "Error: FlameGraph directory does not exist at $FLAMEGRAPH_DIR"
-    echo "Hint: Run \"git clone https://github.com/brendangregg/FlameGraph.git "$FLAMEGRAPH_DIR"\" to download it."
+    echo "[capture.sh] Error: FlameGraph directory does not exist at $FLAMEGRAPH_DIR"
+    echo "[capture.sh] Hint: Run \"git clone https://github.com/brendangregg/FlameGraph.git $FLAMEGRAPH_DIR\" to download it."
     exit 1
 fi
 
-# 检查参数个数
-if [ $# -lt 1 ] || [ $# -gt 2 ]; then
-    echo "Usage: $0 <pid|exec_file_path> [duration]"
-    exit 1
-fi
+# Function to generate the flamegraph
+generate_perf_data() {
+    local mode="$1"
+    local timestamp=$(date +"%Y%m%d%H%M%S")
+    local out_perf="$OUTPUT_DIR/out_${timestamp}.perf"
+    local out_folded="$OUTPUT_DIR/out_${timestamp}.folded"
+    local output_svg="$OUTPUT_DIR/${mode}_${timestamp}.svg"
 
-first_arg="$1"
-duration="$2"
-timestamp=$(date +"%Y%m%d%H%M%S")  # 获取当前时间戳
+    echo "[capture.sh] Converting performance data to readable format..."
+    perf script > "$out_perf" || { echo "[capture.sh] Error: Failed to convert performance data."; exit 1; }
 
-# 判断第一个参数是PID还是可执行文件路径
-if [[ $first_arg =~ ^[0-9]+$ ]]; then
-    pid=$first_arg
-    mode="pid"
-elif [ -f "$first_arg" ]; then
-    exec_file_path=$first_arg
-    mode="exec"
-else
-    echo "Error: The first argument must be a PID or a valid file path to an executable."
-    exit 1
-fi
+    echo "[capture.sh] Collapsing performance data..."
+    "$FLAMEGRAPH_DIR/stackcollapse-perf.pl" "$out_perf" > "$out_folded" || { echo "[capture.sh] Error: Failed to collapse performance data."; exit 1; }
 
-handle_sigint() {
-    echo "Interrupt signal received. Stopping perf record..."
-    # Send SIGINT to the perf process
+    echo "[capture.sh] Generating flamegraph..."
+    "$FLAMEGRAPH_DIR/flamegraph.pl" "$out_folded" > "$output_svg" || { echo "[capture.sh] Error: Failed to generate flamegraph."; exit 1; }
+
+    echo "[capture.sh] Flamegraph saved as $output_svg"
+    # rm -f perf.data || echo "[capture.sh] Warning: Failed to remove perf.data file."
+}
+
+# Signal handlers
+handle_sigusr1() {
+    echo "[capture.sh] SIGUSR1 received from PID $target_pid: Starting perf record..."
+    sleep 1
+    perf stat -e cpu-clock,cycles,instructions,branches,branch-misses,LLC-loads,LLC-load-misses,dTLB-loads,dTLB-load-misses -p "$target_pid" &
+    PERF_PID=$!
+    kill -SIGUSR1 $target_pid
+    wait $PERF_PID
+    wait $target_pid
+}
+
+handle_sigusr2() {
+    echo "[capture.sh] SIGUSR2 received from PID $target_pid: Stopping perf record..."
     kill -INT $PERF_PID
     wait $PERF_PID
-    perf_exit_code=$?
-    # 如果perf因为SIGINT退出，则允许脚本继续执行
-    if [ $perf_exit_code -eq 130 ]; then
-        generate_perf_data
-    fi
+    wait $target_pid
     exit 0
 }
 
-generate_perf_data() {
-    # 在输出目录下定义输出文件的名称
-    out_perf="$OUTPUT_DIR/out_${timestamp}.perf"
-    out_folded="$OUTPUT_DIR/out_${timestamp}.folded"
-    output_svg="$OUTPUT_DIR/${mode}_${timestamp}.svg"
+# Parse arguments
+while getopts ":P:D:E:I" opt; do
+    case $opt in
+        P) target_pid="$OPTARG"; mode="pid" ;;
+        D) duration="$OPTARG" ;;
+        E) exec_file_path="$OPTARG"; mode="exec" ;;
+        I) interactive=true ;;
+        *)
+            echo "[capture.sh] Usage: $0 -P <pid> [-D <duration>] | -E <exec_file_path> [-I]"
+            exit 1
+            ;;
+    esac
+done
 
-    # 将性能数据转换为可读格式
-    echo "Converting performance data to readable format..."
-    perf script > "$out_perf"
-    if [ $? -ne 0 ]; then
-        echo "Error: Failed to convert performance data."
-        exit 1
-    fi
-
-    # 折叠性能数据
-    echo "Collapsing performance data..."
-    "$FLAMEGRAPH_DIR/stackcollapse-perf.pl" "$out_perf" > "$out_folded"
-    if [ $? -ne 0 ]; then
-        echo "Error: Failed to collapse performance data."
-        exit 1
-    fi
-
-    # 生成火焰图
-    echo "Generating flamegraph..."
-    "$FLAMEGRAPH_DIR/flamegraph.pl" "$out_folded" > "$output_svg"
-    if [ $? -ne 0 ]; then
-        echo "Error: Failed to generate flamegraph."
-        exit 1
-    fi
-
-    echo "Flamegraph saved as $output_svg"
-
-    # 删除 perf.data 文件
-    echo "Cleaning up perf.data file..."
-    rm perf.data
-    if [ $? -ne 0 ]; then
-        echo "Error: Failed to remove perf.data file."
-        exit 1
-    fi
-}
-
-# 设置一个信号陷阱，当接收到SIGINT信号时会调用一个函数来处理它
-trap handle_sigint INT
-
-# 根据mode执行perf record
-if [ "$mode" == "pid" ]; then
-    # 根据是否有持续时间来执行perf record
-    if [ -n "$duration" ]; then
-        echo "Recording performance data for PID $pid for $duration seconds..."
-        perf record -F "$CAPTURE_FREQ" -p "$pid" -g -- sleep "$duration"
-    else
-        echo "Recording performance data for PID $pid. Press Ctrl+C to stop recording..."
-        perf record -F "$CAPTURE_FREQ" -p "$pid" -g &
-        PERF_PID=$!
-        # 等待perf进程结束
-        wait $PERF_PID
-    fi
-elif [ "$mode" == "exec" ]; then
-    echo "Recording performance data for executable at path $exec_file_path..."
-    # 在后台执行perf并运行可执行文件
-    if [ -n "$duration" ]; then
-        perf record -F "$CAPTURE_FREQ" -g -- "$exec_file_path" &
-        PERF_PID=$!
-        sleep "$duration"
-        kill -INT $PERF_PID
-        wait $PERF_PID
-    else
-        perf record -F "$CAPTURE_FREQ" -g -- "$exec_file_path"
-    fi
+# Validate arguments
+if [ "$mode" == "pid" ] && [ -n "$exec_file_path" ]; then
+    echo "[capture.sh] Error: -P and -E options are mutually exclusive."
+    exit 1
+fi
+if [ "$mode" == "exec" ] && [ -n "$target_pid" ]; then
+    echo "[capture.sh] Error: -E and -P options are mutually exclusive."
+    exit 1
 fi
 
-# 从这里开始，我们假设perf record已经正常退出，所以可以生成性能数据
-generate_perf_data
+trap handle_sigusr1 SIGUSR1
+trap handle_sigusr2 SIGUSR2
+
+if [ "$mode" == "pid" ]; then
+    if [ -n "$duration" ]; then
+        echo "[capture.sh] Recording performance data for PID $target_pid for $duration seconds..."
+        perf record -F "$CAPTURE_FREQ" --call-graph=dwarf -p "$target_pid" -g -- sleep "$duration"
+        generate_perf_data "pid"
+    else
+        echo "[capture.sh] Recording performance data for PID $target_pid. Press Ctrl+C to stop recording..."
+        perf record -F "$CAPTURE_FREQ" --call-graph=dwarf -p "$target_pid" -g &
+        PERF_PID=$!
+        wait $PERF_PID
+        generate_perf_data "pid"
+    fi
+elif [ "$mode" == "exec" ]; then
+    if [ "$interactive" == true ]; then
+        echo "[capture.sh] Running in interactive mode, Only support perf stat currently."
+        $exec_file_path &
+        target_pid=$!
+        wait $target_pid
+    else
+        echo "[capture.sh] Recording performance data for executable $exec_file_path..."
+        perf record -F "$CAPTURE_FREQ" --call-graph=dwarf -g -- $exec_file_path
+        generate_perf_data "exec"
+    fi
+else
+    echo "[capture.sh] Error: Invalid mode. Use -P for PID or -E for executable file path."
+    exit 1
+fi
+
 exit 0
