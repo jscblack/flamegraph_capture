@@ -9,6 +9,7 @@ OUTPUT_DIR="./perf_log"
 FLAMEGRAPH_DIR="/path/to/FlameGraph"
 CAPTURE_FREQ=499
 
+
 # Create output directory if it doesn't exist
 if [ ! -d "$OUTPUT_DIR" ]; then
     mkdir -p "$OUTPUT_DIR" || { echo "[capture.sh] Error: Failed to create output directory $OUTPUT_DIR."; exit 1; }
@@ -67,6 +68,14 @@ handle_sigusr2() {
     exit 0
 }
 
+handle_sigkill() {
+    echo "[capture.sh] SIGKILL received: Stopping perf record..."
+    kill -TERM $PERF_PID
+    wait $PERF_PID
+    generate_perf_data "pid"
+    exit 0
+}
+
 # Parse arguments
 while getopts ":P:D:E:I" opt; do
     case $opt in
@@ -91,9 +100,6 @@ if [ "$mode" == "exec" ] && [ -n "$target_pid" ]; then
     exit 1
 fi
 
-trap handle_sigusr1 SIGUSR1
-trap handle_sigusr2 SIGUSR2
-
 if [ "$mode" == "pid" ]; then
     if [ -n "$duration" ]; then
         echo "[capture.sh] Recording performance data for PID $target_pid for $duration seconds..."
@@ -103,12 +109,15 @@ if [ "$mode" == "pid" ]; then
         echo "[capture.sh] Recording performance data for PID $target_pid. Press Ctrl+C to stop recording..."
         perf record -F "$CAPTURE_FREQ" --call-graph=dwarf -p "$target_pid" -g &
         PERF_PID=$!
+        trap handle_sigkill SIGINT
         wait $PERF_PID
         generate_perf_data "pid"
     fi
 elif [ "$mode" == "exec" ]; then
     if [ "$interactive" == true ]; then
         echo "[capture.sh] Running in interactive mode, Only support perf stat currently."
+        trap handle_sigusr1 SIGUSR1
+        trap handle_sigusr2 SIGUSR2
         $exec_file_path &
         target_pid=$!
         wait $target_pid
